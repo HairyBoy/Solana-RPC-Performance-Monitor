@@ -168,101 +168,101 @@
                 updateLeaderboard('slotLeaderboard', avgResponseTimes,
                     entry => `${entry.nickname}: ${entry.averageLatency.toFixed(2)}ms`,
                     'Average Response Times');
+                
+                // Calculate time threshold (10 minutes ago)
+                const now = Date.now();
+                const tenMinutesAgo = now - 10 * 60 * 1000;
 
-                // Update graph
+                // Update graph datasets: filter data points and remove empty datasets
                 const datasets = nicknames.map((nickname, index) => {
-                    if (!nicknameColorMap[nickname]) {
-                        nicknameColorMap[nickname] = colors[index % colors.length];
-                    }
-                    const color = nicknameColorMap[nickname];
-                    return {
-                        label: nickname,
-                        data: data.filter(item => item.nickname === nickname).map(item => ({
-                            x: new Date(item.timestamp * 1000),
-                            y: item.latency_ms
-                        })),
-                        borderColor: color,
-                        backgroundColor: color.replace('1)', '0.2)'),
-                        borderWidth: 2,
-                        pointRadius: 0,
-                        hidden: hiddenDatasets[nickname] || false
-                    };
-                });
+                if (!nicknameColorMap[nickname]) {
+                    nicknameColorMap[nickname] = colors[index % colors.length];
+                }
+                const color = nicknameColorMap[nickname];
+                // Filter to only include data points updated in the last 10 minutes.
+                const filteredData = data
+                    .filter(item => 
+                    item.nickname === nickname && (item.timestamp * 1000) >= tenMinutesAgo
+                    )
+                    .map(item => ({
+                    x: new Date(item.timestamp * 1000),
+                    y: item.latency_ms
+                    }));
+                return {
+                    label: nickname,
+                    data: filteredData,
+                    borderColor: color,
+                    backgroundColor: color.replace('1)', '0.2)'),
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    hidden: hiddenDatasets[nickname] || false
+                };
+                }).filter(dataset => dataset.data.length > 0);  // Remove datasets with no recent data
 
                 if (responseTimeChart) {
-                    responseTimeChart.data.datasets = datasets;
-                    responseTimeChart.update();
+                responseTimeChart.data.datasets = datasets;
+                responseTimeChart.update();
                 } else {
-                    const ctx = document.getElementById('responseTimeChart').getContext('2d');
-                    responseTimeChart = new Chart(ctx, {
-                        type: 'line',
-                        data: {
-                            datasets: datasets
+                const ctx = document.getElementById('responseTimeChart').getContext('2d');
+                responseTimeChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                    datasets: datasets
+                    },
+                    options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                        display: false
                         },
-                        options: {
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            plugins: {
-                                legend: {
-                                    display: false
-                                },
-                                title: {
-                                    display: true,
-                                    text: 'Response Times'
-                                }
-                            },
-                            scales: {
-                                x: {
-                                    type: 'time',
-                                    time: {
-                                        unit: 'minute'
-                                    },
-                                    title: {
-                                        display: true,
-                                        text: 'Time'
-                                    }
-                                },
-                                y: {
-                                    title: {
-                                        display: true,
-                                        text: 'Response Time (ms)'
-                                    },
-                                    beginAtZero: true,
-                                    max: Math.max(...datasets.flatMap(dataset => dataset.data.map(point => point.y))) * 1.1
-                                }
-                            }
+                        title: {
+                        display: true,
+                        text: 'Response Times'
                         }
-                    });
+                    },
+                    scales: {
+                        x: {
+                        type: 'time',
+                        time: {
+                            unit: 'minute'
+                        },
+                        title: {
+                            display: true,
+                            text: 'Time'
+                        }
+                        },
+                        y: {
+                        title: {
+                            display: true,
+                            text: 'Response Time (ms)'
+                        },
+                        beginAtZero: true,
+                        max: Math.max(...datasets.flatMap(dataset => dataset.data.map(point => point.y))) * 1.1
+                        }
+                    }
+                    }
+                });
                 }
 
-                // Debugging statements
-                console.log('Chart Data:', responseTimeChart.data.datasets);
-                responseTimeChart.data.datasets.forEach(dataset => {
-                    console.log(`Dataset ${dataset.label} hidden:`, dataset.hidden);
-                });
-                console.log('Hidden Datasets:', hiddenDatasets);
-
-                // Update legend
+                // Update legend based on the filtered datasets
                 const legend = document.getElementById('legend');
                 legend.innerHTML = '';
-                nicknames.forEach((nickname, index) => {
-                    const color = nicknameColorMap[nickname];
-                    const legendItem = document.createElement('div');
-                    legendItem.className = 'legend-item flex items-center';
-                    legendItem.innerHTML = `
-                        <div class="w-4 h-4 mr-2" style="background-color: ${color};"></div>
-                        <span>${nickname}</span>
-                    `;
-                    legendItem.onclick = () => {
-                        const dataset = responseTimeChart.data.datasets.find(ds => ds.label === nickname);
-                        console.log(`Toggling visibility for ${nickname}`);
-                        dataset.hidden = !dataset.hidden;
-                        hiddenDatasets[nickname] = dataset.hidden;
-                        updateYAxisMax();
-                        console.log(`Toggled ${nickname} hidden state to:`, dataset.hidden);
-                    };
-                    legend.appendChild(legendItem);
+                responseTimeChart.data.datasets.forEach((dataset) => {
+                const legendItem = document.createElement('div');
+                legendItem.className = 'legend-item flex items-center';
+                legendItem.innerHTML = `
+                    <div class="w-4 h-4 mr-2" style="background-color: ${dataset.borderColor};"></div>
+                    <span>${dataset.label}</span>
+                `;
+                legendItem.onclick = () => {
+                    dataset.hidden = !dataset.hidden;
+                    hiddenDatasets[dataset.label] = dataset.hidden;
+                    updateYAxisMax();
+                };
+                legend.appendChild(legendItem);
                 });
+
 
                 document.getElementById('status').textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
             } catch (error) {
