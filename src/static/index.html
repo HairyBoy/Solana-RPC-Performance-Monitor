@@ -168,7 +168,21 @@
                 updateLeaderboard('slotLeaderboard', avgResponseTimes,
                     entry => `${entry.nickname}: ${entry.averageLatency.toFixed(2)}ms`,
                     'Average Response Times');
+
                 
+                // Update the slot numbers for each endpoint
+                const slotNumbers = nicknames.map(nickname => {
+                    const endpointData = data.filter(item => item.nickname === nickname);
+                    const endpointSlot = endpointData[0].slot;
+                    return {
+                        nickname,
+                        slot: endpointSlot
+                    };
+                });
+                updateLeaderboard('slotList', slotNumbers,
+                    entry => `${entry.nickname}: ${entry.slot}`,
+                    'Endpoint Slots');
+
                 // Calculate time threshold (10 minutes ago)
                 const now = Date.now();
                 const tenMinutesAgo = now - 10 * 60 * 1000;
@@ -460,6 +474,13 @@
             <div id="legend" style="bottom: -10px;"
                 class="absolute left-0 right-0 bg-white bg-opacity-80 p-2 flex flex-row flex-nowrap justify-center gap-4">
                 <!-- Legend items will be appended here -->
+            </div>
+        </div>
+
+        <!-- New Metric Container -->
+        <div class="bg-white p-4 md:p-6 rounded-lg mb-6">
+            <div class="bg-white p-4 md:p-6 rounded-lg">
+                <div id="slotList"></div>
             </div>
         </div>
 
