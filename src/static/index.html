@@ -7,6 +7,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+    <script src="/static/js/web_socket_monitoring.js"></script>
     <style>
         @keyframes pulse {
             0% {
@@ -49,147 +50,6 @@
         }
     </style>
     <script>
-        class WSWrapper {
-
-            static responseTimesMemoryLength = 150;
-
-            constructor(ws, name) {
-                this.name = name;
-                this.ws = ws;
-                this.time_of_last_response = Date.now() // technically should not initialize value here TODO
-                this.response_times = new Array(WSWrapper.responseTimesMemoryLength).fill(0);
-            }
-
-            updateResponseTimes(newTime) {
-                // Remove the first (oldest) element and add the new value at the end.
-                this.response_times.shift();
-                this.response_times.push(newTime);
-            }
-
-            getAverageResponseTime() {
-                // Filter out any zero values.
-                const nonZeroTimes = this.response_times.filter(time => time !== 0);
-                if (nonZeroTimes.length === 0) {
-                    return 0;
-                }
-                // Sum up the non-zero times.
-                const sum = nonZeroTimes.reduce((acc, curr) => acc + curr, 0);
-                // Return the average.
-                return sum / nonZeroTimes.length;
-            }
-
-            getTimeOfLastResponse() {
-                return this.time_of_last_response
-            }
-
-            updateTimeOfLastResponse(newTime) {
-                this.time_of_last_response = newTime
-            }
-        };
-        function subscribeToSlots(ws) {
-            const requestData = { "jsonrpc": "2.0", "id": 1, "method": "slotSubscribe" }
-            ws.send(JSON.stringify(requestData));
-        }
-        function processSlotNotif(wsWrapper, slot) {
-            const cur_time = Date.now();
-            //console.log(cur_time);
-            //console.log(wsWrapper.getTimeOfLastResponse());
-            const response_time = cur_time - wsWrapper.getTimeOfLastResponse();
-            wsWrapper.updateTimeOfLastResponse(cur_time);
-            console.log('Time between Notifications:', response_time);
-            wsWrapper.updateResponseTimes(response_time);
-            const avgResponseTime = wsWrapper.getAverageResponseTime();
-            console.log('Average Slot Notification Time:', avgResponseTime);
-
-            // Update the element with id "webSocketList"
-            const wsListEl = document.getElementById('webSocketList'+wsWrapper.name);
-            if (wsListEl) {
-                wsListEl.innerHTML = `
-                    <p><strong>Name:</strong> ${wsWrapper.name} </p>
-                    <p><strong>Slot:</strong> ${slot} </p>
-                    <p><strong>Time between slot notifications:</strong> ${response_time} ms</p>
-                    <p><strong>Average time between slot notifications:</strong> ${avgResponseTime.toFixed(2)} ms</p>
-                    <p>--------------------------</p>
-                `;
-            }
-        }
-        const wsEliteStk = new WebSocket("ws://elite.swqos.solanavibestation.com/?api_key=<API-KEY-GOES-HERE>");
-        const wsBasic = new WebSocket("http://basic.rpc.solanavibestation.com/?api_key=<API-KEY-GOES-HERE>");
-        const wsBasicStk = new WebSocket("http://basic.swqos.solanavibestation.com/?api_key=<API-KEY-GOES-HERE>");
-        const wswEliteStk = new WSWrapper(wsEliteStk, "EliteStakedSVS");
-        const wswBasic = new WSWrapper(wsBasic, "BasicSVS");
-        const wswBasicStk = new WSWrapper(wsBasicStk, "BasicStakedSVS");
-        wsEliteStk.addEventListener('open', () => {
-            
-            console.log('Connected to server Elite Staked');
-            wsEliteStk.send('Hello, server!');
-            subscribeToSlots(wsEliteStk);
-        });
-        wsEliteStk.addEventListener('message', (messageEvent) => {
-            console.log(`Received message from server Elite Staked: ${messageEvent.data}`);
-
-            // Parse the string into a JavaScript object.
-            const data = JSON.parse(messageEvent.data);
-
-            // Check the value of the "method" property.
-            if (data.method === "slotNotification") {
-                
-                //console.log("The method is slotNotification");
-                processSlotNotif(wswEliteStk, data.params.result.slot);
-            }
-            
-        });
-        wsEliteStk.addEventListener('close', () => {
-            console.log('Disconnected from server Elite Staked');
-        });
-
-        wsBasic.addEventListener('open', () => {
-            
-            console.log('Connected to server Basic');
-            wsBasic.send('Hello, server!');
-            subscribeToSlots(wsBasic);
-        });
-        wsBasic.addEventListener('message', (messageEvent) => {
-            console.log(`Received message from server Basic: ${messageEvent.data}`);
-
-            // Parse the string into a JavaScript object.
-            const data = JSON.parse(messageEvent.data);
-
-            // Check the value of the "method" property.
-            if (data.method === "slotNotification") {
-
-                //console.log("The method is slotNotification");
-                processSlotNotif(wswBasic, data.params.result.slot);
-            }
-            
-        });
-        wsBasic.addEventListener('close', () => {
-            console.log('Disconnected from server Basic');
-        });
-
-        wsBasicStk.addEventListener('open', () => {
-            
-            console.log('Connected to server Basic');
-            wsBasicStk.send('Hello, server!');
-            subscribeToSlots(wsBasicStk);
-        });
-        wsBasicStk.addEventListener('message', (messageEvent) => {
-            console.log(`Received message from server Basic: ${messageEvent.data}`);
-
-            // Parse the string into a JavaScript object.
-            const data = JSON.parse(messageEvent.data);
-
-            // Check the value of the "method" property.
-            if (data.method === "slotNotification") {
-
-                //console.log("The method is slotNotification");
-                processSlotNotif(wswBasicStk, data.params.result.slot);
-            }
-            
-        });
-        wsBasicStk.addEventListener('close', () => {
-            console.log('Disconnected from server Basic');
-        });
 
         let updating = false;
         let previousValues = {};
@@ -629,11 +489,7 @@
         <!-- Websocket Response Time  -->
         <div class="bg-white p-4 md:p-6 rounded-lg mb-6">
             <p><strong>Websocket Slot Update Times</strong></p>
-            <div class="bg-white p-4 md:p-6 rounded-lg">
-                <div id="webSocketListEliteStakedSVS"></div>
-                <div id="webSocketListBasicStakedSVS"></div>
-                <div id="webSocketListBasicSVS"></div>
-            </div>
+            <div class="bg-white p-4 md:p-6 rounded-lg" id="webSocketList"></div>
         </div>
 
 </html>

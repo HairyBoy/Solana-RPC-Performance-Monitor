@@ -14,6 +14,7 @@ use futures::future::join_all;
 use std::time::Instant;
 use solana_client::rpc_client::RpcClient;
 use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct RPCResponse {
@@ -25,20 +26,27 @@ struct RPCResponse {
     nickname: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Config {
     rpc: RpcConfig,
+    ws: RpcConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct RpcConfig {
     endpoints: Vec<RpcEndpoint>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct RpcEndpoint {
     url: String,
     nickname: String,
+}
+
+#[derive(Clone)]
+struct AppState {
+    db: Arc<DB>,
+    config: Config,
 }
 
 #[derive(Debug, Serialize)]
@@ -235,9 +243,10 @@ fn calculate_consensus(responses: &[RPCResponse]) -> ConsensusStats {
 }
 
 async fn get_metrics(
-    State(db): State<Arc<DB>>,
+    State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>
 ) -> Json<(Vec<RPCResponse>, ConsensusStats)> {
+    let db = state.db;
     let mut responses = Vec::new();
     
     let rpc_filter = params.get("rpc");
@@ -294,6 +303,14 @@ async fn get_metrics(
     Json((public_responses, consensus_stats))
 }
 
+/*
+    Return json information with the websocket endpoints from the config file
+*/
+async fn get_node_websockets(State(state): State<AppState>) -> Json<RpcConfig> {
+    // Return a clone of the websocket endpoints from the config.
+    Json(state.config.ws.clone())
+}
+
 async fn cleanup_old_entries(db: Arc<DB>) -> Result<(), Box<dyn std::error::Error>> {
     let one_hour_ago = Utc::now() - Duration::hours(1);
     let one_hour_ago_ts = one_hour_ago.timestamp();
@@ -326,14 +343,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let app_state = AppState {
+        db: Arc::clone(&db),
+        config, // the loaded config including websocket_endpoints
+    };
+
     std::fs::create_dir_all("static")?;
     std::fs::write(
         "static/index.html",
         include_str!("static/index.html")
     )?;
 
+    /*
+        Include the web socket monitoring file in the compiled project
+    */
+    let wsm_filename = "web_socket_monitoring.js";
+    // Define the source and destination paths.
+    let source_str = format!("src/static/js/{}", wsm_filename);
+    let source = Path::new(&source_str); 
+    let destination_dir = Path::new("static/js");
+    // Create the destination directory if it doesn't exist.
+    fs::create_dir_all(&destination_dir).expect("Failed to create static/js directory");
+    // Copy the file.
+    let destination = destination_dir.join(wsm_filename);
+    fs::copy(&source, &destination).expect(&format!("Failed to copy {}", wsm_filename));
+
     let db_clone = Arc::clone(&db);
-    let endpoints = config.rpc.endpoints.clone();
+    let endpoints = app_state.config.rpc.endpoints.clone();
+
     tokio::spawn(async move {
         loop {
             let tasks: Vec<_> = endpoints
@@ -369,8 +406,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::response::Redirect::to("/static/index.html")
         }))
         .route("/api/metrics", get(get_metrics))
+        .route("/api/node_websockets", get(get_node_websockets))
         .nest_service("/static", get_service(ServeDir::new("static")))
-        .with_state(db);
+        .with_state(app_state);
     
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     println!("Server running on http://localhost:3000");

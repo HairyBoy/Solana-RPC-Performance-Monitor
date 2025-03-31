@@ -5,3 +5,8 @@ endpoints = [
     "https://solana-api.projectserum.com",
     "https://rpc.ankr.com/solana"
 ]
+
+[rpc]
+endpoints = [
+    { url = 'ws://api.mainnet-beta.solana.com', nickname = 'Mainnet' },
+]
