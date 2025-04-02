@@ -55,6 +55,14 @@ endpoints = [
     { url = "https://solana-api.projectserum.com", nickname = "ProjectSerum" },
     { url = "https://rpc.ankr.com/solana", nickname = "Ankr" }
 ]
+
+Configure websocket endpoints as well, if desired:
+
+[ws]
+endpoints = [
+    { url = 'ws://elite.swqos.solanavibestation.com/?api_key=<YOUR-API-KEY-GOES-HERE>', nickname = 'EliteStakedSVS' },
+    { url = 'ws://basic.rpc.solanavibestation.com/?api_key=e<YOUR-API-KEY-GOES-HERE>', nickname = 'BasicSVS' },
+]
 ```
 - You can **add/remove** endpoints as needed.
 - Each endpoint must have a **nickname** for easier identification.

@@ -171,20 +171,6 @@
                     entry => `${entry.nickname}: ${entry.averageLatency.toFixed(2)}ms`,
                     'Average Response Times');
 
-                
-                // Update the slot numbers for each endpoint
-                const slotNumbers = nicknames.map(nickname => {
-                    const endpointData = data.filter(item => item.nickname === nickname);
-                    const endpointSlot = endpointData[0].slot;
-                    return {
-                        nickname,
-                        slot: endpointSlot
-                    };
-                });
-                updateLeaderboard('slotList', slotNumbers,
-                    entry => `${entry.nickname}: ${entry.slot}`,
-                    'Endpoint Slots');
-
                 // Calculate time threshold (10 minutes ago)
                 const now = Date.now();
                 const tenMinutesAgo = now - 10 * 60 * 1000;
@@ -479,17 +465,16 @@
             </div>
         </div>
 
-        <!-- New Metric Container -->
-        <div class="bg-white p-4 md:p-6 rounded-lg mb-6">
-            <div class="bg-white p-4 md:p-6 rounded-lg">
-                <div id="slotList"></div>
+         <!-- WebSocket Metrics -->
+         <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+            <div class="bg-white p-4 md:p-6 rounded-lg shadow-lg">
+                <h3 class="text-lg font-semibold mb-2">WebSocket Win Rate (Last 125 Slots)</h3>
+                <div id="webSocketWinRate"></div>
             </div>
-        </div>
-
-        <!-- Websocket Response Time  -->
-        <div class="bg-white p-4 md:p-6 rounded-lg mb-6">
-            <p><strong>Websocket Slot Update Times</strong></p>
-            <div class="bg-white p-4 md:p-6 rounded-lg" id="webSocketList"></div>
+            <div class="bg-white p-4 md:p-6 rounded-lg shadow-lg">
+                <h3 class="text-lg font-semibold mb-2">WebSocket Slot Details</h3>
+                <div id="webSocketList"></div>
+            </div>
         </div>
 
 </html>
