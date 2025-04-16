@@ -46,7 +46,7 @@ cargo build
 ## ⚙️ Configuration
 
 ### **Edit `config.toml`**
-Before running the project, configure the **Solana RPC endpoints** in `config.toml`:
+Before running the project, configure the **Solana RPC endpoints** in `config.toml` Configure websocket endpoints as well, if desired:
 ```toml
 [rpc]
 endpoints = [
@@ -55,8 +55,6 @@ endpoints = [
     { url = "https://solana-api.projectserum.com", nickname = "ProjectSerum" },
     { url = "https://rpc.ankr.com/solana", nickname = "Ankr" }
 ]
-
-Configure websocket endpoints as well, if desired:
 
 [ws]
 endpoints = [
