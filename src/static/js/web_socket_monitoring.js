@@ -259,6 +259,22 @@ class WebSocketMonitorController {
     }
 
     /**
+     * Initializes and connects all WebSocketMonitor instances by fetching endpoints.
+     * Sets up event listeners for each connection.
+     */
+    async getWebSocketMetrics() {
+        const url = '/api/ws_metrics';
+        try {
+            const response = await fetch(url);
+            const data = await response.json();
+            console.log('Fetched websocket metrics: ', data);
+            return data;
+        } catch (error) {
+            console.error('Error fetching websocket metrics:', error);
+        }
+    }
+
+    /**
      * Checks if there is at least one active WebSocket connection.
      *
      * @returns {boolean} True if any monitor's readyState is OPEN; false otherwise.
@@ -437,6 +453,7 @@ class WebSocketMonitorController {
  * @param {WebSocketMonitorController} controller - The controller managing the WebSocket monitors.
  */
 function checkUpdateStatus(controller) {
+
     const toggleEl = document.getElementById("refreshToggle");
     if (toggleEl) {
         const text = toggleEl.textContent.trim();
@@ -520,6 +537,98 @@ function updateMonitoringPage(controller) {
 }
 
 /**
+ * Updates the monitoring page with win rates and individual monitor status.
+ *
+ * @param {WebSocketMonitorController} controller - The controller managing the monitors.
+ */
+async function updateMonitoringPage2(controller) {
+    const ws_metrics = await controller.getWebSocketMetrics();
+    const container = document.getElementById("webSocketWinRate2");
+
+    if (!ws_metrics) {
+        console.warn("No WebSocket metrics returned from controller (null or undefined).");
+        console.log(ws_metrics);
+        if (container) container.innerHTML = "<p class='text-red-600'>Metrics unavailable: data not loaded yet.</p>";
+        return;
+    }
+
+    if (!ws_metrics.stats) {
+        console.warn("WebSocket metrics object is missing the 'stats' field.");
+        if (container) container.innerHTML = "<p class='text-red-600'>Metrics format error: missing 'stats'.</p>";
+        return;
+    }
+
+    if (ws_metrics.stats.length === 0) {
+        console.warn("WebSocket metrics contain an empty 'stats' list.");
+        if (container) container.innerHTML = "<p class='text-yellow-600'>No WebSocket activity detected in the current slot range.</p>";
+        return;
+    }
+    // Sort descending by win_rate (defaulting to 0 if null)
+    const sortedStats = ws_metrics.stats.slice().sort((a, b) => {
+        const rateA = a.win_rate ?? 0;
+        const rateB = b.win_rate ?? 0;
+        return rateB - rateA;
+    });
+
+    // Build HTML list
+    let html = "<ol>";
+    sortedStats.forEach((item, index) => {
+        const nickname = item.nickname;
+        const winRate = (item.win_rate ?? 0).toFixed(2);
+        const avgDelay = item.avg_delay !== null && item.avg_delay !== undefined
+            ? item.avg_delay.toFixed(2)
+            : "N/A";
+        html += `
+            <li class="flex items-center justify-between mb-2 p-2 rounded">
+                <span class="flex-grow">
+                    ${index + 1}. ${nickname} | Win Rate: ${winRate}% | Avg Delay: ${avgDelay} ms
+                </span>
+            </li>
+        `;
+    });
+    html += "</ol>";
+
+    // Insert into DOM
+    if (container) {
+        container.innerHTML = html;
+    } else {
+        console.warn("Element with id 'webSocketWinRate' not found");
+    }
+
+    // Update individual monitor status from ws_metrics.stats
+    const listContainer = document.getElementById('webSocketList2') || document.body;
+
+    // Clear old content (optional, if you want to fully rebuild each time)
+    listContainer.innerHTML = '';
+
+    ws_metrics.stats.forEach((stat) => {
+        const id = `webSocket2${stat.nickname}`;
+        let wsListEl = document.getElementById(id);
+
+        if (!wsListEl) {
+            wsListEl = document.createElement('div');
+            wsListEl.id = id;
+            wsListEl.className = 'p-3 border rounded mb-2';
+            listContainer.appendChild(wsListEl);
+        }
+›
+        const slot = stat.last_slot_update?.slot_info?.slot ?? 'N/A';
+        const timestamp = stat.last_slot_update?.timestamp
+            ? new Date(stat.last_slot_update.timestamp * 1000).toISOString()
+            : 'N/A';
+        const delay = stat.last_slot_update?.delay ?? 'N/A';
+
+        wsListEl.innerHTML = `
+            <p><strong>Name:</strong> ${stat.nickname}</p>
+            <p><strong>Current Slot:</strong> ${slot}</p>
+            <p><strong>Slot Timestamp:</strong> ${timestamp}</p>
+            <p><strong>Slot Delay:</strong> ${delay.toFixed ? delay.toFixed(2) + ' ms' : delay}</p>
+            <p class="text-gray-400">--------------------------</p>
+        `;
+    });
+}
+
+/**
  * Main initialization function for websocket monitoring.
  * It creates the WebSocketMonitorController and starts periodic updates.
  */
@@ -528,6 +637,7 @@ function initializeMonitoring() {
     // Trigger the function every 2000 milliseconds (2 second)
     setInterval(() => checkUpdateStatus(window.wsmController), 2000);
     setInterval(() => updateMonitoringPage(window.wsmController), 500);
+    setInterval(() => updateMonitoringPage2(window.wsmController), 250);
 }
 
 initializeMonitoring();
