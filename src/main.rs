@@ -1,76 +1,104 @@
+#![allow(dead_code)]
+// Axum (routing and extractors)
 use axum::{
+    extract::{Query, State},
     routing::{get, get_service},
-    Router, Json, extract::Query, extract::State,
+    Json, Router,
 };
+// RocksDB
 use rocksdb::{DB, IteratorMode, Options};
+// Serde (serialization)
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, str};
-use std::collections::{HashMap, HashSet};
+use serde_json::json;
+// Standard library
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    net::SocketAddr,
+    path::Path,
+    str,
+    sync::Arc,
+    time::Instant,
+};
+// Chrono (timestamps)
+use chrono::{Duration, Utc};
+// Tower HTTP (static file serving)
 use tower_http::services::ServeDir;
-use chrono::{Utc, Duration};
-use std::net::SocketAddr;
+// Tokio
 use tokio::task;
-use futures::future::join_all;
-use std::time::Instant;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::protocol::Message,
+};
+use futures::{future::join_all, SinkExt, StreamExt};
+// Solana
 use solana_client::rpc_client::RpcClient;
-use std::{fs, path::Path};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use futures::{StreamExt, SinkExt};
+// URL parsing
 use url::Url;
-use serde_json::{json};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct RPCResponse {
-    timestamp: f64,
-    slot: u64,
-    blockhash: String,
-    latency_ms: u128,
-    rpc_url: String,
+pub struct RpcEndpoint {
+    url: String,
     nickname: String,
-}
-
-/// Represents an entire slot notification received via WebSocket,
-/// including the JSON-RPC envelope and custom fields such as timestamp,
-/// nickname, and a delay value in milliseconds.
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct SlotUpdate {
-    /// The time (in seconds, with fractional part) when the message was received or stored.
-    timestamp: f64,
-    /// The nickname of the endpoint that sent the notification.
-    nickname: String,
-    /// The slot information.
-    slot_info: SlotNotificationResult,
-    /// The delay in milliseconds (calculated as described below).
-    delay: f64,
-}
-
-/// Represents an entire slot notification received via WebSocket,
-/// including the JSON-RPC envelope and custom fields such as timestamp and nickname.
-#[derive(Debug, Serialize, Deserialize)]
-struct WebSocketMessage {
-    jsonrpc: String,
-    method: String,
-    params: NotificationParams
-}
-
-/// Holds the parameters section of the notification.
-#[derive(Debug, Serialize, Deserialize)]
-struct NotificationParams {
-    /// The result contains the slot information.
-    result: SlotNotificationResult,
-    /// The subscription id for the notification.
-    subscription: u64,
 }
 
 /// Represents the slot information contained within the notification.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct SlotNotificationResult {
+pub struct SlotNotificationResult {
     /// The current slot number.
     slot: u64,
     /// The parent slot number.
     parent: u64,
     /// The root slot number.
     root: u64,
+}
+
+/// Holds the parameters section of the notification.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NotificationParams {
+    /// The result contains the slot information.
+    result: SlotNotificationResult,
+    /// The subscription id for the notification.
+    subscription: u64,
+}
+
+/// Represents an entire slot notification received via WebSocket,
+/// including the JSON-RPC envelope and custom fields such as timestamp and nickname.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WebSocketMessage {
+    jsonrpc: String,
+    method: String,
+    params: NotificationParams
+}
+
+/// Represents an entire slot notification received via WebSocket,
+/// including the JSON-RPC envelope and custom fields such as timestamp,
+/// nickname, and a delay value in milliseconds.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SlotUpdate {
+    /// The time (in seconds, with fractional part) when the message was received or stored.
+    pub timestamp: f64,
+    /// The nickname of the endpoint that sent the notification.
+    pub nickname: String,
+    /// The slot information.
+    pub slot_info: SlotNotificationResult,
+    /// The delay in milliseconds, optional until calculated.
+    pub delay: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WebSocketStats {
+    nickname: String,
+    win_rate: f64,
+    avg_delay: f64,
+    slot_details: SlotUpdate,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WebSocketMetricsResponse {
+    start_slot: u64,
+    latest_slot: u64,
+    stats: Vec<WebSocketStats>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -85,8 +113,12 @@ struct RpcConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct RpcEndpoint {
-    url: String,
+struct RPCResponse {
+    timestamp: f64,
+    slot: u64,
+    blockhash: String,
+    latency_ms: u128,
+    rpc_url: String,
     nickname: String,
 }
 
@@ -122,20 +154,6 @@ struct ConsensusStats {
     slot_leaderboard: Vec<LeaderboardEntry>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-struct WebSocketStats {
-    nickname: String,
-    win_rate: f64,
-    avg_delay: f64,
-    last_slot_update: SlotUpdate,
-}
-
-#[derive(Debug, Serialize)]
-struct WebSocketMetricsResponse {
-    start_slot: u64,
-    latest_slot: u64,
-    stats: Vec<WebSocketStats>,
-}
 
 
 fn setup_db() -> Arc<DB> {
@@ -378,52 +396,82 @@ async fn get_metrics(
 
 async fn get_ws_metrics(State(state): State<AppState>) -> Json<WebSocketMetricsResponse> {
     let db = Arc::clone(&state.ws_db);
-    let max_eval_range = 200;
+    let eval_range = 200;
 
-    let (win_counts, start_slot1, latest_slot1) =
-        match compute_win_rates_with_range(Arc::clone(&db), max_eval_range) {
-            Some(t) => t,
-            None => return Json(WebSocketMetricsResponse {
+    let latest_slot = match get_latest_websocket_slot(Arc::clone(&db)) {
+        Some(slot) => slot,
+        None => {
+            return Json(WebSocketMetricsResponse {
                 start_slot: 0,
                 latest_slot: 0,
                 stats: vec![],
-            }),
-        };
+            })
+        }
+    };
 
-    let (avg_list, start_slot2, latest_slot2) =
-        match compute_avg_delays_with_range(Arc::clone(&db), max_eval_range) {
-            Some(t) => t,
-            None => return Json(WebSocketMetricsResponse {
+    let candidate1 = latest_slot.saturating_sub(eval_range);
+    let candidate2 = get_earliest_common_websocket_slot_with_min(Arc::clone(&db), candidate1).unwrap_or(0);
+    let start_slot = candidate1.max(candidate2);
+
+    let endpoint_names: Vec<String> = state
+        .config
+        .ws
+        .endpoints
+        .iter()
+        .map(|e| e.nickname.clone())
+        .collect();
+
+    let win_rates = match compute_win_rates_with_range(
+        Arc::clone(&db),
+        &endpoint_names,
+        start_slot,
+        latest_slot,
+    )
+    .await
+    {
+        Some(rates) => rates,
+        None => {
+            return Json(WebSocketMetricsResponse {
                 start_slot: 0,
                 latest_slot: 0,
                 stats: vec![],
-            }),
-        };
-    
-    let latest_updates = get_latest_slot_updates_by_nickname(Arc::clone(&db));
+            })
+        }
+    };
 
-    let start_slot = start_slot1.max(start_slot2);
-    let latest_slot = latest_slot1.min(latest_slot2);
-    let total_slots = (latest_slot - start_slot + 1) as f64;
+    let avg_list = match compute_avg_delays_with_range(
+        Arc::clone(&db),
+        &endpoint_names,
+        start_slot,
+        latest_slot,
+    )
+    .await
+    {
+        Some(list) => list,
+        None => {
+            return Json(WebSocketMetricsResponse {
+                start_slot: 0,
+                latest_slot: 0,
+                stats: vec![],
+            })
+        }
+    };
 
-    let mut all_nicknames: HashSet<String> = win_counts.keys().cloned().collect();
-    all_nicknames.extend(avg_list.iter().map(|(nick, _)| nick.clone()));
-    all_nicknames.extend(latest_updates.keys().cloned());
+    let slot_details =
+        get_slot_updates_for_target_slot(Arc::clone(&db), &endpoint_names, latest_slot);
 
     let mut stats = Vec::new();
-    for nickname in all_nicknames {
-        let win_rate = win_counts
-            .get(&nickname)
-            .map(|count| (*count as f64 / total_slots) * 100.0)
-            .unwrap_or(0.0);
+    for nickname in &endpoint_names {
+        let win_rate = *win_rates.get(nickname).unwrap_or(&0.0);
         let avg_delay = avg_list
             .iter()
-            .find(|(nick, _)| nick == &nickname)
+            .find(|(nick, _)| nick == nickname)
             .and_then(|(_, delay_opt)| *delay_opt)
             .unwrap_or(-1.0);
-        let last_slot_update = match latest_updates.get(&nickname) {
-            Some(update) => update.clone(),
-            None => SlotUpdate {
+        let slot_details = slot_details
+            .get(nickname)
+            .cloned()
+            .unwrap_or(SlotUpdate {
                 timestamp: 0.0,
                 nickname: nickname.clone(),
                 slot_info: SlotNotificationResult {
@@ -431,15 +479,14 @@ async fn get_ws_metrics(State(state): State<AppState>) -> Json<WebSocketMetricsR
                     parent: 0,
                     root: 0,
                 },
-                delay: -1.0,
-            },
-        };
+                delay: Some(-1.0),
+            });
 
         stats.push(WebSocketStats {
-            nickname,
+            nickname: nickname.clone(),
             win_rate,
             avg_delay,
-            last_slot_update
+            slot_details,
         });
     }
 
@@ -449,15 +496,14 @@ async fn get_ws_metrics(State(state): State<AppState>) -> Json<WebSocketMetricsR
         stats,
     };
 
-    //println!("WebSocket metrics: {:?}", response);
+    if false {
+        match serde_json::to_string_pretty(&response) {
+            Ok(json_str) => println!("\n🛰️ WebSocketMetricsResponse JSON:\n{}", json_str),
+            Err(err) => eprintln!("Failed to serialize WebSocketMetricsResponse: {}", err),
+        }
+    }
+
     Json(response)
-}
-/*
-    Return json information with the websocket endpoints from the config file
-*/
-async fn get_node_websockets(State(state): State<AppState>) -> Json<RpcConfig> {
-    // Return a clone of the websocket endpoints from the config.
-    Json(state.config.ws.clone())
 }
 
 async fn cleanup_old_entries(db: Arc<DB>) -> Result<(), Box<dyn std::error::Error>> {
@@ -513,6 +559,7 @@ async fn cleanup_websocket_db_with_threshold(
 async fn cleanup_websocket_db(db: Arc<DB>) -> Result<(), Box<dyn std::error::Error>> {
     cleanup_websocket_db_with_threshold(db, 500).await
 }
+
 
 /// Connects to the websocket server at the given URL, sends a subscription message,
 /// and returns the websocket stream.
@@ -571,6 +618,7 @@ async fn handle_websocket_messages(
                                 // Check the method field.
                                 if ws_message.method == "slotNotification" {
                                     // Call a separate function to process slot notifications.
+                                    //println!("slotNotification message with params: {}", *&text);
                                     process_slot_notification(ws_message, &endpoint, Arc::clone(&websocket_db)).await;
                                 } else {
                                     println!("Received a non-slotNotification message with method: {}", ws_message.method);
@@ -621,7 +669,6 @@ async fn process_slot_notification(
     endpoint: &RpcEndpoint,
     websocket_db: Arc<DB>,
 ) {
-    // Get a high-precision timestamp (in seconds with fractional precision).
     let timestamp = match Utc::now().timestamp_nanos_opt() {
         Some(n) => n as f64 / 1e9,
         None => {
@@ -630,65 +677,21 @@ async fn process_slot_notification(
         }
     };
 
-    // Get the nickname and slot info.
     let nickname = endpoint.nickname.clone();
     let slot_info = ws_message.params.result.clone();
-    let current_slot = slot_info.slot;
 
-    // Search the entire database for any existing SlotUpdate for the same slot (from any endpoint)
-    // with a delay of 0 (within epsilon tolerance)
-    let mut existing_timestamp: Option<f64> = None;
-    let iter = websocket_db.iterator(IteratorMode::Start);
-    for item in iter {
-        if let Ok((key, value)) = item {
-            if let Ok(key_str) = str::from_utf8(&key) {
-                // Our key is formatted as "nickname:slot" -- split it.
-                let parts: Vec<&str> = key_str.split(':').collect();
-                if parts.len() == 2 {
-                    // Try parsing the second part as the slot.
-                    if let Ok(slot_num) = parts[1].parse::<u64>() {
-                        if slot_num == current_slot {
-                            // If the slot matches, deserialize the value.
-                            if let Ok(existing_update) = serde_json::from_slice::<SlotUpdate>(&value) {
-                                // Check if the stored delay is zero (within floating‐point epsilon).
-                                if (existing_update.delay - 0.0).abs() < std::f64::EPSILON {
-                                    existing_timestamp = Some(existing_update.timestamp);
-                                    break; // Found an entry; no need to continue.
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Calculate the delay in milliseconds.
-    // If an existing record for the same slot with delay == 0 is found, compute:
-    // delay = (current_timestamp - stored_timestamp) * 1000.
-    // Otherwise, if none exists, the delay is 0.
-    let delay = if let Some(old_ts) = existing_timestamp {
-        (timestamp - old_ts) * 1000.0
-    } else {
-        0.0
-    };
-
-    // Create a new SlotUpdate struct with the new values.
     let slot_update = SlotUpdate {
         timestamp,
         nickname: nickname.clone(),
         slot_info: slot_info.clone(),
-        delay,
+        delay: None,
     };
 
-    // Serialize the SlotUpdate struct to a JSON string.
     let serialized = serde_json::to_string(&slot_update)
         .expect("Failed to serialize SlotUpdate");
 
-    // Construct the key in the format "nickname:slot" (using the new key structure).
     let key = format!("{}:{}", nickname, slot_info.slot);
 
-    // Save the serialized SlotUpdate to the websocket_db.
     websocket_db
         .put(key.as_bytes(), serialized.as_bytes())
         .expect("Failed to write slot update to websocket_db");
@@ -717,29 +720,56 @@ fn get_latest_websocket_slot(db: Arc<DB>) -> Option<u64> {
     max_slot
 }
 
-fn get_latest_slot_updates_by_nickname(db: Arc<DB>) -> HashMap<String, SlotUpdate> {
-    let mut latest_updates: HashMap<String, SlotUpdate> = HashMap::new();
+pub fn get_slot_updates_for_target_slot(
+    db: Arc<DB>,
+    endpoint_names: &[String],
+    slot: u64,
+) -> HashMap<String, SlotUpdate> {
+    let mut updates: HashMap<String, SlotUpdate> = HashMap::new();
 
-    for item in db.iterator(IteratorMode::Start) {
-        if let Ok((key, value)) = item {
-            if let Ok(key_str) = str::from_utf8(&key) {
-                if let Some((nickname, slot_str)) = key_str.split_once(':') {
-                    if let Ok(slot) = slot_str.parse::<u64>() {
-                        if let Ok(update) = serde_json::from_slice::<SlotUpdate>(&value) {
-                            match latest_updates.get(nickname) {
-                                Some(existing) if existing.slot_info.slot >= slot => {}
-                                _ => {
-                                    latest_updates.insert(nickname.to_string(), update);
-                                }
-                            }
-                        }
-                    }
-                }
+    // Determine the winner's timestamp (earliest valid timestamp for the slot)
+    let winner_ts = endpoint_names
+        .iter()
+        .filter_map(|nickname| {
+            let key = format!("{}:{}", nickname, slot);
+            db.get(key.as_bytes()).ok().flatten().and_then(|value| {
+                serde_json::from_slice::<SlotUpdate>(&value).ok()
+            }).map(|su| su.timestamp)
+        })
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Precompute fallback delay if winner_ts exists
+    let fallback_delay = winner_ts.map(|winner| {
+        let now = Utc::now().timestamp_nanos_opt().unwrap_or(0) as f64 / 1e9;
+        (now - winner) * 1000.0
+    });
+
+    for nickname in endpoint_names {
+        let key = format!("{}:{}", nickname, slot);
+        if let Ok(Some(value)) = db.get(key.as_bytes()) {
+            if let Ok(slot_update) = serde_json::from_slice::<SlotUpdate>(&value) {
+                updates.insert(nickname.clone(), slot_update);
+                continue;
             }
         }
+
+        // If no update found, insert fallback SlotUpdate
+        updates.insert(
+            nickname.clone(),
+            SlotUpdate {
+                timestamp: -1.0,
+                nickname: nickname.clone(),
+                slot_info: SlotNotificationResult {
+                    slot,
+                    parent: u64::MAX,
+                    root: u64::MAX,
+                },
+                delay: fallback_delay,
+            },
+        );
     }
 
-    latest_updates
+    updates
 }
 
 /// Returns the earliest common slot number among all unique endpoints found in the RocksDB.
@@ -754,50 +784,52 @@ fn get_latest_slot_updates_by_nickname(db: Arc<DB>) -> HashMap<String, SlotUpdat
 ///
 /// * `Option<u64>` - The lowest slot number that appears for every endpoint, or None if no common slot exists.
 fn get_earliest_common_websocket_slot(db: Arc<rocksdb::DB>) -> Option<u64> {
-    // Map from endpoint nickname to the set of slot numbers received.
+    
+    return get_earliest_common_websocket_slot_with_min(db, 0);
+}
+
+fn get_earliest_common_websocket_slot_with_min(
+    db: Arc<rocksdb::DB>,
+    min_slot: u64,
+) -> Option<u64> {
     let mut endpoint_slots: HashMap<String, HashSet<u64>> = HashMap::new();
 
-    // Iterate over all entries in the RocksDB.
     let iter = db.iterator(IteratorMode::Start);
     for item in iter {
         if let Ok((key, _)) = item {
-            // Convert the key bytes to a string.
             if let Ok(key_str) = str::from_utf8(&key) {
-                // The key is expected to be "nickname:slot".
-                let parts: Vec<&str> = key_str.split(':').collect();
-                if parts.len() == 2 {
-                    let nickname = parts[0].to_string();
-                    if let Ok(slot) = parts[1].parse::<u64>() {
-                        // Insert the slot number for this nickname.
-                        endpoint_slots
-                            .entry(nickname)
-                            .or_insert_with(HashSet::new)
-                            .insert(slot);
+                if let Some((nickname, slot_str)) = key_str.split_once(':') {
+                    if let Ok(slot) = slot_str.parse::<u64>() {
+                        if slot >= min_slot {
+                            endpoint_slots
+                                .entry(nickname.to_string())
+                                .or_insert_with(HashSet::new)
+                                .insert(slot);
+                        }
                     }
                 }
             }
         }
     }
 
-    // Return None if no endpoints were found.
     if endpoint_slots.is_empty() {
         return None;
     }
 
-    // Compute the intersection of all slot sets.
     let mut common_slots: Option<HashSet<u64>> = None;
     for (_nickname, slots) in endpoint_slots {
         common_slots = match common_slots {
             None => Some(slots),
             Some(current_common) => {
-                // Compute the intersection between the current common set and the new set.
-                let new_common: HashSet<u64> = current_common.intersection(&slots).copied().collect();
-                Some(new_common)
+                let intersection: HashSet<u64> = current_common
+                    .intersection(&slots)
+                    .copied()
+                    .collect();
+                Some(intersection)
             }
-        }
+        };
     }
 
-    // If the intersection is non-empty, return the minimum slot; otherwise, return None.
     common_slots?.into_iter().min()
 }
 
@@ -816,233 +848,160 @@ fn print_latest_websocket_slot(db: Arc<DB>) {
 
 
 
-/// Returns the nickname of the endpoint that has a SlotUpdate for the target slot
-/// with a delay value of 0. This indicates that this update was recorded earliest.
-///
-/// It iterates over all entries in the RocksDB and, for each entry:
-///  - It parses the value into a `SlotUpdate` struct.
-///  - It checks if the slot in `slot_info.slot` matches the target slot.
-///  - It then checks whether the `delay` field is exactly 0 (within an epsilon).
-///
-/// # Arguments
-///
-/// * `db` - A reference to the RocksDB instance storing websocket notifications.
-/// * `target_slot` - The slot number for which to find the notification with a 0 delay.
-///
-/// # Returns
-///
-/// * `Option<String>` - The nickname of the endpoint that first reported the target slot
-///   (i.e. with a delay of 0), or `None` if no such notification is found.
-fn get_slot_winner(db: &rocksdb::DB, target_slot: u64) -> Option<(String, f64)> {
-    let epsilon = std::f64::EPSILON;
-    let iter = db.iterator(IteratorMode::Start);
-    for item in iter {
-        if let Ok((_, value)) = item {
-            // Attempt to parse the value into a SlotUpdate struct.
+pub async fn get_slot_winner(
+    db: Arc<DB>,
+    endpoint_names: &[String],
+    target_slot: u64,
+) -> Option<(String, f64)> {
+    let mut slot_updates: Vec<SlotUpdate> = Vec::new();
+
+    for nickname in endpoint_names {
+        let key = format!("{}:{}", nickname, target_slot);
+        if let Ok(Some(value)) = db.get(key.as_bytes()) {
             if let Ok(slot_update) = serde_json::from_slice::<SlotUpdate>(&value) {
-                // Check if this notification is for the target slot.
                 if slot_update.slot_info.slot == target_slot {
-                    // Check if the delay is 0 (within epsilon tolerance).
-                    if (slot_update.delay - 0.0).abs() < epsilon {
-                        return Some((slot_update.nickname, slot_update.timestamp));
-                    }
+                    slot_updates.push(slot_update);
                 }
             }
         }
     }
-    None
-}
 
-fn print_slot_winner(db: &DB, target_slot: u64) {
-
-    if let Some((nickname, _)) = get_slot_winner(db, target_slot) {
-        println!(
-            "For slot {} the earliest notification was from endpoint '{}'",
-            target_slot, nickname
-        );
-    } else {
-        println!("No winner found for slot {}", target_slot);
+    if slot_updates.is_empty() {
+        return None;
     }
+
+    let winner = slot_updates
+        .iter()
+        .min_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal))?;
+
+    // Update delays for all slot_updates relative to the winner's timestamp
+    update_delays_for_timestamp(Arc::clone(&db), target_slot, slot_updates.clone(), winner.timestamp).await;
+
+    Some((winner.nickname.clone(), winner.timestamp))
 }
 
-fn compute_win_rates_with_range(
-    db: Arc<DB>,
-    max_eval_range: u64,
-) -> Option<(HashMap<String, u64>, u64, u64)> {
-    let latest_slot = get_latest_websocket_slot(Arc::clone(&db))?;
-    let candidate1 = latest_slot.saturating_sub(max_eval_range);
-    let candidate2 = get_earliest_common_websocket_slot(Arc::clone(&db)).unwrap_or(0);
-    let start_slot = candidate1.max(candidate2);
+pub async fn update_delays_for_timestamp(
+    db: Arc<rocksdb::DB>,
+    slot: u64,
+    updates: Vec<SlotUpdate>,
+    winner_ts: f64,
+) {
+    let db_clone = Arc::clone(&db);
 
-    let mut total_evaluated = 0;
+    task::spawn_blocking(move || {
+        let mut batch = rocksdb::WriteBatch::default();
+
+        for mut update in updates {
+            update.delay = Some((update.timestamp - winner_ts) * 1000.0);
+            let key = format!("{}:{}", update.nickname, slot);
+            if let Ok(serialized) = serde_json::to_vec(&update) {
+                batch.put(key.as_bytes(), &serialized);
+            }
+        }
+
+        if let Err(e) = db_clone.write(batch) {
+            eprintln!("❌ Failed to write batch delay updates: {}", e);
+        }
+    })
+    .await
+    .expect("Failed to spawn blocking batch write task");
+}
+
+pub async fn compute_win_rates_with_range(
+    db: Arc<DB>,
+    endpoint_names: &[String],
+    start_slot: u64,
+    latest_slot: u64,
+) -> Option<HashMap<String, f64>> {
     let mut win_counts: HashMap<String, u64> = HashMap::new();
+    let mut total_evaluated = 0;
 
     for slot in start_slot..=latest_slot {
-        if let Some((winner, _)) = get_slot_winner(&*db, slot) {
+        if let Some((winner, _)) = get_slot_winner(Arc::clone(&db), endpoint_names, slot).await {
             total_evaluated += 1;
             *win_counts.entry(winner).or_insert(0) += 1;
         }
     }
 
-    Some((win_counts, start_slot, latest_slot))
-}
-
-fn print_win_rates_with_range(db: Arc<DB>, max_eval_range: u64) {
-    match compute_win_rates_with_range(db, max_eval_range) {
-        Some((win_counts, start_slot, latest_slot)) => {
-            println!("Win rates for slots {} to {}:", start_slot, latest_slot);
-            for (nickname, count) in win_counts {
-                let percentage = (count as f64 / (latest_slot - start_slot + 1) as f64) * 100.0;
-                println!("Endpoint '{}' won {:.2}% of the time.", nickname, percentage);
-            }
-        }
-        None => {
-            println!("No slot notifications found.");
-        }
+    let win_sum: u64 = win_counts.values().sum();
+    if win_sum != total_evaluated {
+        println!(
+            "⚠️ Win count total ({}) does not match total evaluated slots ({}).",
+            win_sum, total_evaluated
+        );
     }
+
+    if total_evaluated == 0 {
+        return None;
+    }
+
+    // Convert counts to percentages
+    let win_rates = win_counts
+        .into_iter()
+        .map(|(nickname, count)| (nickname, (count as f64 / total_evaluated as f64) * 100.0))
+        .collect();
+
+    Some(win_rates)
 }
 
-fn print_win_rates(db: Arc<DB>) {
-    print_win_rates_with_range(db, 200);
+pub async fn compute_avg_delays_with_range(
+    db: Arc<DB>,
+    endpoint_names: &[String],
+    start_slot: u64,
+    latest_slot: u64,
+) -> Option<Vec<(String, Option<f64>)>> {
+    if start_slot > latest_slot {
+        return None;
+    }
+
+    let mut results = Vec::new();
+    for endpoint in endpoint_names {
+        let delay = avg_delay_for_endpoint(Arc::clone(&db), endpoint_names, endpoint, start_slot, latest_slot).await;
+        results.push((endpoint.clone(), delay));
+    }
+
+    Some(results)
 }
 
-/// Calculates the average delay (in milliseconds) for a given endpoint over the slot range [start_slot, end_slot].
-///
-/// For each slot in the range:
-/// - If there is a SlotUpdate entry in the DB for the given endpoint, use its stored delay.
-/// - Otherwise, if a winner is found via `get_slot_winner2`, compute the delay as:
-///      (current_time (from timestamp_nanos_opt) - winner_timestamp) * 1000.
-///   (If no winner is found, that slot is skipped.)
-///
-/// Returns the average delay as an Option<f64>.
-///
-/// # Arguments
-///
-/// * `db` - A reference to the RocksDB database.
-/// * `endpoint` - The endpoint nickname (which is now the prefix of the key).
-/// * `start_slot` - The beginning of the evaluation range (inclusive).
-/// * `end_slot` - The end of the evaluation range (inclusive).
-fn avg_delay_for_endpoint(db: &DB, nickname: &str, start_slot: u64, end_slot: u64) -> Option<f64> {
+pub async fn avg_delay_for_endpoint(
+    db: Arc<DB>,
+    endpoint_names: &[String],
+    nickname: &str,
+    start_slot: u64,
+    end_slot: u64,
+) -> Option<f64> {
+    let mut total_delay = 0.0;
+    let mut count = 0;
 
-    // We'll count how many entries match the prefix.
-    let mut total_entries = 0;
-
-    // Create a HashMap to store the delay for each slot for this endpoint.
-    let mut endpoint_delays: HashMap<u64, f64> = HashMap::new();
-
-    // Iterate over all DB entries.
-    for item in db.iterator(IteratorMode::Start) {
-        if let Ok((key, value)) = item {
-            // Convert the key from bytes to a string.
-            if let Ok(key_str) = str::from_utf8(&key) {
-                // Manually check whether the key starts with the prefix.
-                if key_str.starts_with(&nickname) {
-                    total_entries += 1;
-                    // The expected key format is "nickname:slot"
-                    let parts: Vec<&str> = key_str.split(':').collect();
-                    if parts.len() == 2 {
-                        // Try to parse the slot number.
-                        if let Ok(slot) = parts[1].parse::<u64>() {
-                            // Only process slots within our evaluation range.
-                            if slot >= start_slot && slot <= end_slot {
-                                // Deserialize the stored value into a SlotUpdate struct.
-                                if let Ok(slot_update) = serde_json::from_slice::<SlotUpdate>(&value) {
-                                    //println!("Found entry for slot {}: delay={}", slot, slot_update.delay);
-                                    // Record the delay for this slot.
-                                    endpoint_delays.insert(slot, slot_update.delay);
-                                }
-                            }
-                        }
-                    }
+    for slot in start_slot..=end_slot {
+        let key = format!("{}:{}", nickname, slot);
+        if let Ok(Some(value)) = db.get(key.as_bytes()) {
+            if let Ok(slot_update) = serde_json::from_slice::<SlotUpdate>(&value) {
+                if let Some(delay) = slot_update.delay {
+                    total_delay += delay;
+                    count += 1;
+                    continue;
                 }
             }
         }
-    }
 
-    //println!("Total entries matching '{}' : {}", &nickname, total_entries);
-
-    let mut total_delay = 0.0;
-    let mut count = 0;
-    // For each slot in the evaluation range, determine the delay.
-    for slot in start_slot..=end_slot {
-        if let Some(&stored_delay) = endpoint_delays.get(&slot) {
-            //println!("stored delay: {}", &stored_delay);
-            total_delay += stored_delay;
+        if let Some((_, winner_ts)) = get_slot_winner(Arc::clone(&db), endpoint_names, slot).await {
+            let now = match Utc::now().timestamp_nanos_opt() {
+                Some(n) => n as f64 / 1e9,
+                None => {
+                    eprintln!("Failed to obtain high-precision timestamp.");
+                    continue;
+                }
+            };
+            total_delay += (now - winner_ts) * 1000.0;
             count += 1;
-        } else {
-            // Fallback: if no delay is stored for this endpoint for the slot,
-            // try to get the winner’s timestamp for that slot.
-            if let Some((_, winner_ts)) = get_slot_winner(db, slot) {
-                // Get a high-precision current time (in seconds with fractional part).
-                let now = match Utc::now().timestamp_nanos_opt() {
-                    Some(n) => n as f64 / 1e9,
-                    None => {
-                        eprintln!("Failed to obtain high-precision timestamp.");
-                        continue;
-                    }
-                };
-                // Compute the delay in milliseconds.
-                let computed_delay = (now - winner_ts) * 1000.0;
-                //println!("computed delay: {}", &computed_delay);
-                total_delay += computed_delay;
-                count += 1;
-            }
         }
     }
 
     if count > 0 {
-        Some(total_delay / (count as f64))
+        Some(total_delay / count as f64)
     } else {
         None
-    }
-}
-
-fn compute_avg_delays_with_range(
-    db: Arc<DB>,
-    max_eval_range: u64,
-) -> Option<(Vec<(String, Option<f64>)>, u64, u64)> {
-    let latest_slot = get_latest_websocket_slot(Arc::clone(&db))?;
-    let candidate1 = latest_slot.saturating_sub(max_eval_range);
-    let candidate2 = get_earliest_common_websocket_slot(Arc::clone(&db)).unwrap_or(0);
-    let start_slot = candidate1.max(candidate2);
-
-    let mut endpoints: HashSet<String> = HashSet::new();
-    let iter = db.iterator(IteratorMode::Start);
-    for item in iter {
-        if let Ok((_, value)) = item {
-            if let Ok(slot_update) = serde_json::from_slice::<SlotUpdate>(&value) {
-                endpoints.insert(slot_update.nickname);
-            }
-        }
-    }
-
-    let mut results = Vec::new();
-    for endpoint in endpoints {
-        let avg = avg_delay_for_endpoint(&db, &endpoint, start_slot, latest_slot);
-        results.push((endpoint, avg));
-    }
-
-    Some((results, start_slot, latest_slot))
-}
-
-fn print_avg_delays_with_range(db: Arc<DB>, max_eval_range: u64) {
-    match compute_avg_delays_with_range(db, max_eval_range) {
-        Some((results, _start_slot, _latest_slot)) => {
-            for (endpoint, avg_delay_opt) in results {
-                match avg_delay_opt {
-                    Some(avg_delay) => {
-                        println!(
-                            "Endpoint '{}' has an average delay of {:.2} ms",
-                            endpoint, avg_delay
-                        );
-                    }
-                    None => {
-                        println!("Endpoint '{}' has no delay data", endpoint);
-                    }
-                }
-            }
-        }
-        None => println!("No slot notifications found."),
     }
 }
 
@@ -1051,7 +1010,7 @@ fn print_avg_delays_with_range(db: Arc<DB>, max_eval_range: u64) {
 /// This function iterates over the entire database starting from the beginning.
 /// It attempts to convert each key and value into a UTF-8 string and then prints it.
 /// If the conversion fails, it prints the raw bytes (in debug format).
-fn print_database(db: &DB) {
+/*fn print_database(db: &DB) {
     // Create an iterator starting from the beginning.
     let iter = db.iterator(IteratorMode::Start);
     for item in iter {
@@ -1067,48 +1026,11 @@ fn print_database(db: &DB) {
             }
         }
     }
-}
+}*/
 
-/// Wrapper function that uses a default max evaluation range of 200 slots.
-fn print_avg_delays(db: Arc<DB>) {
-    print_avg_delays_with_range(db, 200);
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-
-    /*
-    // Parse the WebSocket URL.
-    let my_url = "ws://elite.swqos.solanavibestation.com/?api_key=f17b7753247a92d255f0fd2d1c44b4fb";
-    //let ws_url = "wss://echo.websocket.events"; // Example echo server URL.
-    let url = Url::parse(my_url).expect("Invalid URL");
-
-    // Connect to the WebSocket server.
-    let (mut ws_stream, response) = connect_async(url)
-        .await
-        .expect("Failed to connect to WebSocket");
-
-    println!("Connected to the websocket server");
-    println!("HTTP status: {}", response.status());
-
-    // Create the JSON subscription request.
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "slotSubscribe"
-    });
-
-    // Send the JSON request as a text message.
-    ws_stream
-       .send(Message::Text(request.to_string()))
-       .await
-       .expect("Failed to send subscribe message");
-    
-    // Spawn the WebSocket message handler on a separate task.
-    tokio::spawn(handle_websocket_messages(ws_stream));
-    */
-
-
 
     let db = setup_db();
     let websocket_db = setup_websocket_db();
@@ -1143,32 +1065,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Spawn a task that calls print_latest_websocket_slot every 2 seconds.
-    let ws_db_clone = Arc::clone(&websocket_db);
-    tokio::spawn(async move {
-        loop {
-            print_latest_websocket_slot(Arc::clone(&ws_db_clone));
-            if let Some(latest_slot) = get_latest_websocket_slot(Arc::clone(&ws_db_clone)) {
-                print_slot_winner(&*ws_db_clone, latest_slot);
-                print_win_rates(Arc::clone(&ws_db_clone));
-            } else {
-                println!("No latest websocket slot available.");
-            }
-            print_avg_delays(Arc::clone(&ws_db_clone));
-            tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-        }
-    });
-
-
-
-
-
-
-
-
-
-
-
 
     std::fs::create_dir_all("static")?;
     std::fs::write(
@@ -1179,16 +1075,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /*
         Include the web socket monitoring file in the compiled project
     */
-    let wsm_filename = "web_socket_monitoring.js";
-    // Define the source and destination paths.
-    let source_str = format!("src/static/js/{}", wsm_filename);
-    let source = Path::new(&source_str); 
-    let destination_dir = Path::new("static/js");
-    // Create the destination directory if it doesn't exist.
-    fs::create_dir_all(&destination_dir).expect("Failed to create static/js directory");
-    // Copy the file.
-    let destination = destination_dir.join(wsm_filename);
-    fs::copy(&source, &destination).expect(&format!("Failed to copy {}", wsm_filename));
+    let js_files = vec![
+        "web_socket_monitoring_new.js",
+    ];
+    for filename in js_files {
+        let source_str = format!("src/static/js/{}", filename); // <-- create String first
+        let source = Path::new(&source_str);
+        let destination_dir = Path::new("static/js");
+        fs::create_dir_all(destination_dir).expect("Failed to create static/js directory");
+
+        let destination = destination_dir.join(filename);
+        fs::copy(source, &destination).expect(&format!("Failed to copy {}", filename));
+    }
 
     let db_clone = Arc::clone(&db);
     let endpoints = app_state.config.rpc.endpoints.clone();
@@ -1233,7 +1131,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }))
         .route("/api/metrics", get(get_metrics))
         .route("/api/ws_metrics", get(get_ws_metrics))
-        .route("/api/node_websockets", get(get_node_websockets))
         .nest_service("/static", get_service(ServeDir::new("static")))
         .with_state(app_state);
     
