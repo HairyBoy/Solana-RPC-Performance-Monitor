@@ -1,25 +1,38 @@
-
 /**
- * Controller class for managing multiple WebSocketMonitor instances.
- * Responsible for initialization, disconnection, and evaluating slot notifications.
+ * Controller class responsible for retrieving WebSocket metrics from the Rust server
+ * and updating the frontend user interface accordingly.
  */
 class WebSocketMetricsController {
 
+    /**
+     * Initializes the controller with a default active refresh state.
+     */
     constructor() {
         this.refresh_active = true;
     }
 
+    /**
+     * Sets the status of the periodic UI refresh.
+     *
+     * @param {boolean} status - `true` to enable refreshing, `false` to pause updates.
+     */
     setRefreshStatus(status) {
         this.refresh_active = status;
     }
 
+    /**
+     * Gets the current refresh status.
+     *
+     * @returns {boolean} `true` if refreshing is enabled, `false` otherwise.
+     */
     getRefreshStatus() {
         return this.refresh_active;
     }
 
     /**
-     * Initializes and connects all WebSocketMonitor instances by fetching endpoints.
-     * Sets up event listeners for each connection.
+     * Fetches current WebSocket metrics from the Rust backend API.
+     *
+     * @returns {Promise<Object|undefined>} The parsed metrics JSON or `undefined` on error.
      */
     async getWebSocketMetrics() {
         const url = '/api/ws_metrics';
@@ -34,8 +47,8 @@ class WebSocketMetricsController {
     }
 
     /**
-     * Updates the monitoring page with win rates and individual monitor status.
-     *
+     * Updates the monitoring UI with the latest WebSocket metrics.
+     * Handles win rate leaderboard and detailed endpoint statistics.
      */
     async updateMonitoringPage() {
 
@@ -71,15 +84,20 @@ class WebSocketMetricsController {
 
     }
 
+    /**
+     * Renders the sorted WebSocket win rate leaderboard into the DOM.
+     *
+     * @param {Object} ws_metrics - The metrics object returned from the backend.
+     */
     updateWinRatesLeaderboard(ws_metrics) {
 
-        const fromSlotElement = document.getElementById('fromSlot')
-        if(fromSlotElement) {
-            fromSlotElement.innerHTML = `<p class="text-sm text-gray-600" id="fromSlot">From slot: \t${ws_metrics.start_slot}</p>`;
+        const fromSlotElement = document.getElementById('fromSlot');
+        if (fromSlotElement) {
+            fromSlotElement.textContent = `${ws_metrics.start_slot}`;
         }
-        const toSlotElement = document.getElementById('toSlot')
-        if(toSlotElement) {
-            toSlotElement.innerHTML = `<p class="text-sm text-gray-600" id="toSlot">To slot: \t${ws_metrics.latest_slot}</p>`;
+        const toSlotElement = document.getElementById('toSlot');
+        if (toSlotElement) {
+            toSlotElement.textContent = `${ws_metrics.latest_slot}`;
         }
 
         const sortedStats = ws_metrics.stats.slice().sort((a, b) => {
@@ -112,6 +130,12 @@ class WebSocketMetricsController {
         }
     }
 
+    /**
+     * Displays detailed information for each WebSocket endpoint, including slot,
+     * timestamp, and delay.
+     *
+     * @param {Object} ws_metrics - The metrics object returned from the backend.
+     */
     updateSlotDetails(ws_metrics) {
         const listContainer = document.getElementById('webSocketList2') || document.body;
         listContainer.innerHTML = '';
@@ -133,7 +157,7 @@ class WebSocketMetricsController {
             }
     
             const slot = stat.slot_details?.slot_info?.slot ?? 'N/A';
-            const timestamp = stat.slot_details?.timestamp
+            const timestamp = (stat.slot_details?.timestamp > 0)
                 ? new Date(stat.slot_details.timestamp * 1000).toISOString()
                 : 'N/A';
             const delay = stat.slot_details?.delay ?? 'N/A';
@@ -143,7 +167,6 @@ class WebSocketMetricsController {
                 <p><strong>Slot:</strong> ${slot}</p>
                 <p><strong>Slot Timestamp:</strong> ${timestamp}</p>
                 <p><strong>Slot Delay:</strong> ${delay.toFixed ? delay.toFixed(2) + ' ms' : delay}</p>
-                <p class="text-gray-400">--------------------------</p>
             `;
         });
     }
@@ -151,9 +174,10 @@ class WebSocketMetricsController {
 
 
 /**
- * Checks whether the user has paused or active update mode and controls the websockets accordingly.
+ * Checks the current UI toggle state to determine whether updates should
+ * be paused or resumed. Updates the controller accordingly.
  *
- * @param {WebSocketMonitorController} controller - The controller managing the WebSocket monitors.
+ * @param {WebSocketMetricsController} controller - The WebSocket controller instance.
  */
 function checkUpdateStatus(controller) {
 
@@ -173,8 +197,7 @@ function checkUpdateStatus(controller) {
 }
 
 /**
- * Main initialization function for websocket monitoring.
- * It creates the WebSocketMonitorController and starts periodic updates.
+ * Initializes the monitoring controller and starts periodic update loops.
  */
 function initializeMonitoring() {
     window.wsMetricsController = new WebSocketMetricsController();

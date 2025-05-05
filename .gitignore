@@ -3,3 +3,4 @@ config.toml
 Cargo.lock
 rpc_metrics.db
 /static
+websocket_metrics.db

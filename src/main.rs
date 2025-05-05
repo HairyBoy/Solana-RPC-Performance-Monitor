@@ -1,161 +1,141 @@
-#![allow(dead_code)]
-// Axum (routing and extractors)
-use axum::{
-    extract::{Query, State},
-    routing::{get, get_service},
-    Json, Router,
-};
-// RocksDB
+//! This crate implements a monitoring tool for Solana RPC endpoints.
+//! It collects latency and slot notification metrics, persists them using RocksDB,
+//! and serves data via an Axum-based API.
+
+// --- Imports ---
+use axum::{extract::{Query, State}, routing::{get, get_service}, Json, Router};
 use rocksdb::{DB, IteratorMode, Options};
-// Serde (serialization)
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-// Standard library
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    net::SocketAddr,
-    path::Path,
-    str,
-    sync::Arc,
-    time::Instant,
-};
-// Chrono (timestamps)
+use std::{collections::{HashMap, HashSet}, fs, net::SocketAddr, path::Path, str, sync::Arc, time::Instant};
 use chrono::{Duration, Utc};
-// Tower HTTP (static file serving)
 use tower_http::services::ServeDir;
-// Tokio
 use tokio::task;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::protocol::Message,
-};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures::{future::join_all, SinkExt, StreamExt};
-// Solana
 use solana_client::rpc_client::RpcClient;
-// URL parsing
 use url::Url;
 
+/// Represents a Solana RPC or WebSocket endpoint.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RpcEndpoint {
-    url: String,
-    nickname: String,
+    pub url: String,
+    pub nickname: String,
 }
 
-/// Represents the slot information contained within the notification.
+/// Slot information structure from Solana WebSocket.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SlotNotificationResult {
-    /// The current slot number.
-    slot: u64,
-    /// The parent slot number.
-    parent: u64,
-    /// The root slot number.
-    root: u64,
+    pub slot: u64,
+    pub parent: u64,
+    pub root: u64,
 }
 
-/// Holds the parameters section of the notification.
+/// Inner `params` field in WebSocket slot notifications.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NotificationParams {
-    /// The result contains the slot information.
-    result: SlotNotificationResult,
-    /// The subscription id for the notification.
-    subscription: u64,
+    pub result: SlotNotificationResult,
+    pub subscription: u64,
 }
 
-/// Represents an entire slot notification received via WebSocket,
-/// including the JSON-RPC envelope and custom fields such as timestamp and nickname.
+/// Top-level WebSocket message structure.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WebSocketMessage {
-    jsonrpc: String,
-    method: String,
-    params: NotificationParams
+    pub jsonrpc: String,
+    pub method: String,
+    pub params: NotificationParams,
 }
 
-/// Represents an entire slot notification received via WebSocket,
-/// including the JSON-RPC envelope and custom fields such as timestamp,
-/// nickname, and a delay value in milliseconds.
+/// Represents a processed WebSocket slot notification.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SlotUpdate {
-    /// The time (in seconds, with fractional part) when the message was received or stored.
     pub timestamp: f64,
-    /// The nickname of the endpoint that sent the notification.
     pub nickname: String,
-    /// The slot information.
     pub slot_info: SlotNotificationResult,
-    /// The delay in milliseconds, optional until calculated.
     pub delay: Option<f64>,
 }
 
+/// Aggregated WebSocket performance statistics per endpoint.
 #[derive(Clone, Debug, Serialize)]
 pub struct WebSocketStats {
-    nickname: String,
-    win_rate: f64,
-    avg_delay: f64,
-    slot_details: SlotUpdate,
+    pub nickname: String,
+    pub win_rate: f64,
+    pub avg_delay: f64,
+    pub slot_details: SlotUpdate,
 }
 
+/// Full response returned by the /api/ws_metrics endpoint.
 #[derive(Debug, Serialize)]
 pub struct WebSocketMetricsResponse {
-    start_slot: u64,
-    latest_slot: u64,
-    stats: Vec<WebSocketStats>,
+    pub start_slot: u64,
+    pub latest_slot: u64,
+    pub stats: Vec<WebSocketStats>,
 }
 
+/// Configuration loaded from `config.toml`, includes RPC and WS sections.
 #[derive(Debug, Deserialize, Clone)]
-struct Config {
-    rpc: RpcConfig,
-    ws: RpcConfig,
+pub struct Config {
+    pub rpc: RpcConfig,
+    pub ws: RpcConfig,
 }
 
+/// Subsection of configuration listing endpoints.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct RpcConfig {
-    endpoints: Vec<RpcEndpoint>,
+pub struct RpcConfig {
+    pub endpoints: Vec<RpcEndpoint>,
 }
 
+/// RPC polling response payload.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct RPCResponse {
-    timestamp: f64,
-    slot: u64,
-    blockhash: String,
-    latency_ms: u128,
-    rpc_url: String,
-    nickname: String,
+pub struct RPCResponse {
+    pub timestamp: f64,
+    pub slot: u64,
+    pub blockhash: String,
+    pub latency_ms: u128,
+    pub rpc_url: String,
+    pub nickname: String,
 }
 
+/// Application state shared across Axum routes.
 #[derive(Clone)]
-struct AppState {
-    db: Arc<DB>,
-    ws_db: Arc<DB>,
-    config: Config,
+pub struct AppState {
+    pub db: Arc<DB>,
+    pub ws_db: Arc<DB>,
+    pub config: Config,
 }
 
+/// Used for ranking latency and slot positions.
 #[derive(Debug, Serialize)]
-struct LeaderboardEntry {
-    nickname: String,
-    value: u64,
-    latency_ms: u128,
-    timestamp: f64,
+pub struct LeaderboardEntry {
+    pub nickname: String,
+    pub value: u64,
+    pub latency_ms: u128,
+    pub timestamp: f64,
 }
 
+/// Summarizes consensus and performance stats across endpoints.
 #[derive(Debug, Serialize)]
-struct ConsensusStats {
-    fastest_rpc: String,
-    slowest_rpc: String,
-    fastest_latency: u128,
-    slowest_latency: u128,
-    consensus_blockhash: String,
-    consensus_slot: u64,
-    consensus_percentage: f64,
-    total_rpcs: usize,
-    average_latency: f64,
-    slot_difference: i64,
-    slot_skew: String,
-    latency_leaderboard: Vec<LeaderboardEntry>,
-    slot_leaderboard: Vec<LeaderboardEntry>,
+pub struct ConsensusStats {
+    pub fastest_rpc: String,
+    pub slowest_rpc: String,
+    pub fastest_latency: u128,
+    pub slowest_latency: u128,
+    pub consensus_blockhash: String,
+    pub consensus_slot: u64,
+    pub consensus_percentage: f64,
+    pub total_rpcs: usize,
+    pub average_latency: f64,
+    pub slot_difference: i64,
+    pub slot_skew: String,
+    pub latency_leaderboard: Vec<LeaderboardEntry>,
+    pub slot_leaderboard: Vec<LeaderboardEntry>,
 }
 
-
-
+/// Initializes and returns a RocksDB instance for storing RPC metrics.
+/// The database is configured with LZ4 compression and a 64MB write buffer.
+///
+/// # Returns
+/// A shared `Arc<DB>` handle pointing to the opened RocksDB instance.
 fn setup_db() -> Arc<DB> {
     let mut opts = Options::default();
     opts.create_if_missing(true);
@@ -165,7 +145,11 @@ fn setup_db() -> Arc<DB> {
     Arc::new(DB::open(&opts, "rpc_metrics.db").expect("Failed to open database"))
 }
 
-/// Set up a second RocksDB database for WebSocket slot notifications.
+/// Initializes and returns a separate RocksDB instance for storing WebSocket slot updates.
+/// Uses the same configuration as `setup_db`, but stores data in `websocket_metrics.db`.
+///
+/// # Returns
+/// A shared `Arc<DB>` handle pointing to the opened WebSocket RocksDB instance.
 fn setup_websocket_db() -> Arc<DB> {
     let mut opts = Options::default();
     opts.create_if_missing(true);
@@ -174,12 +158,25 @@ fn setup_websocket_db() -> Arc<DB> {
     Arc::new(DB::open(&opts, "websocket_metrics.db").expect("Failed to open websocket database"))
 }
 
+/// Loads the configuration file (`config.toml`) and deserializes it into a `Config` struct.
+///
+/// # Returns
+/// `Ok(Config)` if successful, otherwise an error.
 fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     let config_str = fs::read_to_string("config.toml")?;
     let config: Config = toml::from_str(&config_str)?;
     Ok(config)
 }
 
+/// Queries a Solana RPC endpoint for its current blockhash and slot.
+/// Measures request latency and stores the response in RocksDB with a timestamp.
+///
+/// # Arguments
+/// * `endpoint` - The Solana RPC endpoint to query.
+/// * `db` - Shared RocksDB database to persist the response.
+///
+/// # Returns
+/// `Ok(())` on success, or an error if any RPC or RocksDB operation fails.
 async fn fetch_blockhash_and_slot(endpoint: RpcEndpoint, db: Arc<DB>) -> Result<(), Box<dyn std::error::Error>> {
     println!("Querying {}: {}", endpoint.nickname, endpoint.url);
     let client = RpcClient::new(endpoint.url.clone());
@@ -222,6 +219,16 @@ async fn fetch_blockhash_and_slot(endpoint: RpcEndpoint, db: Arc<DB>) -> Result<
     Ok(())
 }
 
+/// Aggregates RPC responses to determine consensus metrics, such as:
+/// - Most common blockhash and slot
+/// - Fastest/slowest RPC endpoints by latency
+/// - Slot skew, leaderboards, and average latency
+///
+/// # Arguments
+/// * `responses` - A slice of `RPCResponse` items to analyze.
+///
+/// # Returns
+/// A `ConsensusStats` struct containing the aggregated metrics.
 fn calculate_consensus(responses: &[RPCResponse]) -> ConsensusStats {
     if responses.is_empty() {
         return ConsensusStats {
@@ -333,6 +340,15 @@ fn calculate_consensus(responses: &[RPCResponse]) -> ConsensusStats {
     }
 }
 
+/// Axum handler for `/api/metrics`. Retrieves filtered RPC responses from the database,
+/// applies time and RPC filters, computes consensus stats, and returns the result.
+///
+/// # Arguments
+/// * `state` - Shared application state containing the database and config.
+/// * `params` - Query parameters for filtering by `rpc`, `from`, and `to`.
+///
+/// # Returns
+/// A JSON response containing RPC response list and consensus statistics.
 async fn get_metrics(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>
@@ -394,6 +410,14 @@ async fn get_metrics(
     Json((public_responses, consensus_stats))
 }
 
+/// Axum handler for `/api/ws_metrics`. Computes win rates, delays, and recent slot info
+/// for each WebSocket endpoint over a defined evaluation slot range.
+///
+/// # Arguments
+/// * `state` - Shared application state with RocksDB and config.
+///
+/// # Returns
+/// A JSON response with WebSocket metrics and recent slot statistics.
 async fn get_ws_metrics(State(state): State<AppState>) -> Json<WebSocketMetricsResponse> {
     let db = Arc::clone(&state.ws_db);
     let eval_range = 200;
@@ -506,6 +530,13 @@ async fn get_ws_metrics(State(state): State<AppState>) -> Json<WebSocketMetricsR
     Json(response)
 }
 
+/// Deletes RPC entries from RocksDB that are older than one hour.
+///
+/// # Arguments
+/// * `db` - RocksDB instance to clean up.
+///
+/// # Returns
+/// `Ok(())` if cleanup succeeds; otherwise returns an error.
 async fn cleanup_old_entries(db: Arc<DB>) -> Result<(), Box<dyn std::error::Error>> {
     let one_hour_ago = Utc::now() - Duration::hours(1);
     let one_hour_ago_ts = one_hour_ago.timestamp();
@@ -526,7 +557,14 @@ async fn cleanup_old_entries(db: Arc<DB>) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-
+/// Deletes WebSocket slot entries whose slot number is older than the threshold from the latest.
+///
+/// # Arguments
+/// * `db` - RocksDB database for WebSocket data.
+/// * `threshold` - Number of slots to retain.
+///
+/// # Returns
+/// `Ok(())` on success, or an error on failure.
 async fn cleanup_websocket_db_with_threshold(
     db: Arc<DB>,
     threshold: u64,
@@ -556,22 +594,27 @@ async fn cleanup_websocket_db_with_threshold(
     Ok(())
 }
 
+/// Shortcut for cleaning up WebSocket database with a default threshold of 500 slots.
+///
+/// # Arguments
+/// * `db` - RocksDB instance for WebSocket data.
+///
+/// # Returns
+/// `Ok(())` or an error on failure.
 async fn cleanup_websocket_db(db: Arc<DB>) -> Result<(), Box<dyn std::error::Error>> {
     cleanup_websocket_db_with_threshold(db, 500).await
 }
 
 
-/// Connects to the websocket server at the given URL, sends a subscription message,
-/// and returns the websocket stream.
+/// Connects to a Solana WebSocket endpoint and sends a `slotSubscribe` request.
 ///
 /// # Arguments
-///
-/// * `url` - The parsed Url of the websocket endpoint.
-/// * `endpoint` - A reference to the RpcEndpoint struct containing metadata like nickname.
+/// * `url` - Parsed WebSocket URL to connect to.
+/// * `endpoint` - Endpoint metadata (nickname and URL).
 ///
 /// # Returns
-///
-/// A `tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>` that can be used to further process messages.
+/// A WebSocket stream used to receive slot notifications.
+
 async fn connect_and_subscribe(url: Url, endpoint: &RpcEndpoint) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     // Connect to the websocket server.
     let (mut ws_stream, response) = connect_async(url)
@@ -601,6 +644,13 @@ async fn connect_and_subscribe(url: Url, endpoint: &RpcEndpoint) -> tokio_tungst
     ws_stream
 }
 
+/// Processes messages received from a WebSocket stream.
+/// Parses slot notifications and stores them in the database.
+///
+/// # Arguments
+/// * `ws_stream` - Active WebSocket connection.
+/// * `websocket_db` - RocksDB database for WebSocket slot updates.
+/// * `endpoint` - Metadata for the current endpoint.
 async fn handle_websocket_messages(
     mut ws_stream: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     websocket_db: Arc<DB>,
@@ -656,14 +706,12 @@ async fn handle_websocket_messages(
     }
 }
 
-/// Processes a slot notification message. It calculates the current high-precision timestamp,
-/// checks whether a SlotUpdate for the same slot with a delay of zero exists in the database,
-/// computes the delay accordingly, creates a new SlotUpdate struct, serializes it, and saves it.
+/// Processes a single slot notification, generating a `SlotUpdate` and saving it to RocksDB.
 ///
 /// # Arguments
-/// * `ws_message` - The parsed WebSocketMessage.
-/// * `endpoint` - A reference to the RpcEndpoint metadata.
-/// * `websocket_db` - An Arc pointer to the RocksDB instance for WebSocket notifications.
+/// * `ws_message` - Parsed `WebSocketMessage` containing slot info.
+/// * `endpoint` - RPC endpoint metadata.
+/// * `websocket_db` - RocksDB for storing slot updates.
 async fn process_slot_notification(
     ws_message: WebSocketMessage,
     endpoint: &RpcEndpoint,
@@ -697,8 +745,13 @@ async fn process_slot_notification(
         .expect("Failed to write slot update to websocket_db");
 }
 
-/// Returns the maximum slot number (latest slot) reported by any websocket,
-/// based on the key format "nickname:slot".
+/// Finds and returns the highest slot number stored in the WebSocket RocksDB.
+///
+/// # Arguments
+/// * `db` - WebSocket RocksDB instance.
+///
+/// # Returns
+/// The highest slot number, or `None` if no data exists.
 fn get_latest_websocket_slot(db: Arc<DB>) -> Option<u64> {
     let iter = db.iterator(IteratorMode::Start);
     let mut max_slot: Option<u64> = None;
@@ -720,6 +773,16 @@ fn get_latest_websocket_slot(db: Arc<DB>) -> Option<u64> {
     max_slot
 }
 
+/// Retrieves `SlotUpdate` entries for a specific slot across all endpoints.
+/// Fills missing data with placeholder entries.
+///
+/// # Arguments
+/// * `db` - WebSocket RocksDB instance.
+/// * `endpoint_names` - List of endpoint nicknames.
+/// * `slot` - Target slot number.
+///
+/// # Returns
+/// A mapping of endpoint nicknames to their respective `SlotUpdate` structs.
 pub fn get_slot_updates_for_target_slot(
     db: Arc<DB>,
     endpoint_names: &[String],
@@ -772,22 +835,14 @@ pub fn get_slot_updates_for_target_slot(
     updates
 }
 
-/// Returns the earliest common slot number among all unique endpoints found in the RocksDB.
-/// 
-/// This function uses the fact that each key is in the format "nickname:slot"
+/// Determines the earliest slot number shared across all endpoints above a given minimum.
 ///
 /// # Arguments
-///
-/// * `db` - An `Arc<DB>` instance representing the RocksDB where the slot updates are stored.
+/// * `db` - WebSocket RocksDB instance.
+/// * `min_slot` - Minimum slot to consider.
 ///
 /// # Returns
-///
-/// * `Option<u64>` - The lowest slot number that appears for every endpoint, or None if no common slot exists.
-fn get_earliest_common_websocket_slot(db: Arc<rocksdb::DB>) -> Option<u64> {
-    
-    return get_earliest_common_websocket_slot_with_min(db, 0);
-}
-
+/// The earliest shared slot, or `None` if no overlap is found.
 fn get_earliest_common_websocket_slot_with_min(
     db: Arc<rocksdb::DB>,
     min_slot: u64,
@@ -833,21 +888,16 @@ fn get_earliest_common_websocket_slot_with_min(
     common_slots?.into_iter().min()
 }
 
-/// Uses the `get_latest_websocket_slot` function to check the database and prints
-/// the latest (highest) slot value found.
-fn print_latest_websocket_slot(db: Arc<DB>) {
-    match get_latest_websocket_slot(db.clone()) {
-        Some(slot) => println!("The latest slot reported by any websocket is: {}", slot),
-        None => println!("No slot notifications found in the websocket_metrics database."),
-    }
-    match get_earliest_common_websocket_slot(db.clone()) {
-        Some(slot) => println!("The earliest slot reported by all websockets is: {}", slot),
-        None => println!("No slot notifications found in the websocket_metrics database."),
-    }
-}
-
-
-
+/// Determines the "winner" of a slot (the endpoint that reported it first),
+/// then updates delay values for all participants.
+///
+/// # Arguments
+/// * `db` - WebSocket RocksDB instance.
+/// * `endpoint_names` - List of endpoint nicknames.
+/// * `target_slot` - Slot number to evaluate.
+///
+/// # Returns
+/// The nickname and timestamp of the winner, or `None` if no entries exist.
 pub async fn get_slot_winner(
     db: Arc<DB>,
     endpoint_names: &[String],
@@ -880,6 +930,13 @@ pub async fn get_slot_winner(
     Some((winner.nickname.clone(), winner.timestamp))
 }
 
+/// Updates the delay field in all `SlotUpdate`s for a given slot based on the winner's timestamp.
+///
+/// # Arguments
+/// * `db` - RocksDB instance.
+/// * `slot` - Slot number to update.
+/// * `updates` - Vector of `SlotUpdate`s to modify.
+/// * `winner_ts` - Timestamp of the winning endpoint.
 pub async fn update_delays_for_timestamp(
     db: Arc<rocksdb::DB>,
     slot: u64,
@@ -907,6 +964,16 @@ pub async fn update_delays_for_timestamp(
     .expect("Failed to spawn blocking batch write task");
 }
 
+/// Calculates win rates (percent of wins) for each endpoint over a slot range.
+///
+/// # Arguments
+/// * `db` - WebSocket RocksDB instance.
+/// * `endpoint_names` - List of endpoint nicknames.
+/// * `start_slot` - Start of evaluation range.
+/// * `latest_slot` - End of evaluation range.
+///
+/// # Returns
+/// Map of nicknames to their win percentages, or `None` if no data found.
 pub async fn compute_win_rates_with_range(
     db: Arc<DB>,
     endpoint_names: &[String],
@@ -944,6 +1011,16 @@ pub async fn compute_win_rates_with_range(
     Some(win_rates)
 }
 
+/// Computes the average delay for each endpoint across a given slot range.
+///
+/// # Arguments
+/// * `db` - RocksDB instance.
+/// * `endpoint_names` - List of endpoint nicknames.
+/// * `start_slot` - Starting slot number.
+/// * `latest_slot` - Ending slot number.
+///
+/// # Returns
+/// Vector of tuples (nickname, average delay), or `None` if no data.
 pub async fn compute_avg_delays_with_range(
     db: Arc<DB>,
     endpoint_names: &[String],
@@ -963,6 +1040,17 @@ pub async fn compute_avg_delays_with_range(
     Some(results)
 }
 
+/// Computes the average delay in milliseconds for a single endpoint over a slot range.
+///
+/// # Arguments
+/// * `db` - RocksDB database instance.
+/// * `endpoint_names` - All endpoint names (needed for fallback).
+/// * `nickname` - Endpoint to compute delay for.
+/// * `start_slot` - Beginning of slot range.
+/// * `end_slot` - End of slot range.
+///
+/// # Returns
+/// `Some(average_delay)` or `None` if no valid delay values found.
 pub async fn avg_delay_for_endpoint(
     db: Arc<DB>,
     endpoint_names: &[String],
@@ -1004,30 +1092,6 @@ pub async fn avg_delay_for_endpoint(
         None
     }
 }
-
-/// Prints every key–value pair in the given RocksDB database.
-///
-/// This function iterates over the entire database starting from the beginning.
-/// It attempts to convert each key and value into a UTF-8 string and then prints it.
-/// If the conversion fails, it prints the raw bytes (in debug format).
-/*fn print_database(db: &DB) {
-    // Create an iterator starting from the beginning.
-    let iter = db.iterator(IteratorMode::Start);
-    for item in iter {
-        match item {
-            Ok((key, value)) => {
-                // Try to convert the key and value to strings.
-                let key_str = str::from_utf8(&key).unwrap_or("<non-utf8 key>");
-                let value_str = str::from_utf8(&value).unwrap_or("<non-utf8 value>");
-                println!("Key: {}, Value: {}", key_str, value_str);
-            }
-            Err(e) => {
-                eprintln!("Error reading database entry: {:?}", e);
-            }
-        }
-    }
-}*/
-
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
